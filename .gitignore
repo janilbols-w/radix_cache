@@ -1,0 +1,6 @@
+*__pycache__
+*.egg-info
+*archive
+*output
+*.ipynb_checkpoints
+*qwen-bailian-usagetraces-anon
