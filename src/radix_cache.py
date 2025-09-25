@@ -11,7 +11,15 @@ from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from dataclasses import dataclass
 
+# observability
+import os
+from prometheus_client import REGISTRY
+import prometheus_client
+from typing import Dict, List, Optional, Union
+
+# RadixTree
 class TreeNode:
 
     counter = 0
@@ -25,8 +33,8 @@ class TreeNode:
         self.key = None
         self.value = None
         self.lock_ref = 0
-        self.create_time = create_time if create_time else time.time()
-        self.last_access_time = last_access_time if last_access_time else time.time()
+        self.create_time = create_time if create_time is not None else time.time()
+        self.last_access_time = last_access_time if last_access_time is not None else time.time()
 
         self.hit_count = hit_count
         # indicating the node is loading KV cache from host
@@ -69,23 +77,40 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
 
     return i
 
-class MetricsTracker():
+@dataclass
+class RadixCacheStats:
+    num_queries: int    # total tok/blocks is queried by match_prefix
+    num_hits: int       # total tok/blocks hits is returned from match_prefix
+    num_actives: int
+    num_stores: int
+    num_evict: int
+    
+    init_time: float
+    retrieve_time_list: List
+    max_retrieve_time: float
+    store_duration_list: List
+    max_store_duration: float
+
+class RadixCacheStatsMonitor():
     def __init__(self):
         self.init_time = None
         self.reset()
     
     def reset(self):
-        self.num_queries = 0 # total tok/blocks is queried by match_prefix
-        self.num_hits = 0 # total tok/blocks hits is returned from match_prefix
-        self.num_actives = 0
-        self.num_stores = 0
-        self.init_time = self.init_time if self.init_time else None
-        self.retrieve_time_list = []
-        self.max_retrieve_time = 0.0
-        self.store_duration_list = []
-        self.max_store_duration = 0.0
+        self.num_queries: int = 0 # total tok/blocks is queried by match_prefix
+        self.num_hits: int = 0 # total tok/blocks hits is returned from match_prefix
+        self.num_actives: int = 0
+        self.num_stores: int = 0
+        self.num_evict: int = 0 # num tok/blocks evicted
 
-    def show_metrics(self):
+        self.init_time: float = self.init_time if self.init_time is not None else None
+        self.retrieve_time_list: List = []
+        self.max_retrieve_time: float = 0.0
+        self.store_duration_list: List = []
+        self.max_store_duration: float = 0.0
+
+
+    def show_stats(self):
         print("="*50)
         print("num_queries = {}".format(self.num_queries))
         print("num_hits = {}".format(self.num_hits))
@@ -97,6 +122,20 @@ class MetricsTracker():
         print("max_retrieve_time = {}".format(self.max_retrieve_time))
         print("store_duration_list = {}".format(self.store_duration_list[:10]))
         print("max_store_duration = {}".format(self.max_store_duration))
+    
+    def get_stats(self):
+        return RadixCacheStats(
+            num_queries = self.num_queries,
+            num_hits = self.num_hits,
+            num_actives = self.num_actives,
+            num_stores=self.num_stores,
+            num_evict=self.num_evict,
+            init_time=self.init_time,
+            retrieve_time_list=self.retrieve_time_list,
+            max_retrieve_time=self.max_retrieve_time,
+            store_duration_list=self.store_duration_list,
+            max_store_duration=self.max_store_duration
+            )
 
     def update_hits(self, num_queries: int, 
                     num_hits: int, 
@@ -110,6 +149,9 @@ class MetricsTracker():
         if retrieve_time is not None:
             self.update_retrieve_time(retrieve_time)
     
+    def update_actives(self, num_new_actives: int):
+        self.num_actives += num_new_actives
+
     def update_retrieve_time(self, retrieve_time: float):
         self.retrieve_time_list.append(retrieve_time)
         if self.max_retrieve_time < retrieve_time:
@@ -120,9 +162,9 @@ class MetricsTracker():
         self.max_retrieve_time = max(self.retrieve_time_list)
 
     
-    def update_stores(self, num_stores: int, timestamp: float):
+    def update_stores(self, num_new_stores: int, timestamp: float):
         # triggered when instert
-        self.num_stores += num_stores
+        self.num_stores += num_new_stores
         if not self.init_time:
             self.init_time = timestamp
         self.init_time = min(self.init_time, timestamp)
@@ -157,7 +199,7 @@ class RadixCache():
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset(timestamp=timestamp)
-        self.metrics = MetricsTracker()
+        self.stats_monitor = RadixCacheStatsMonitor()
 
     ##### Public API #####
 
@@ -181,6 +223,7 @@ class RadixCache():
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+        query_len = len(key)
         if self.disable or len(key) == 0:
             return (
                 torch.empty(
@@ -206,6 +249,8 @@ class RadixCache():
                 value = val
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        # update stats
+        self.stats_monitor.update_hits(query_len, len(value), timestamp - last_node.last_access_time)
         return value, last_node
 
     def insert(self, key: List, value=None, timestamp: float = None):
@@ -294,8 +339,8 @@ class RadixCache():
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
-    def show_metrics(self):
-        self.metrics.show_metrics()
+    def show_stats(self):
+        self.stats_monitor.show_stats()
 
     def update_cache_status(self, cur_time: float = None):
         if cur_time is None:
@@ -303,21 +348,21 @@ class RadixCache():
         nodes = self._collect_nodes()
         # retrieve time
         retrieve_time_list = [node.last_access_time - node.create_time for node in nodes]
-        self.metrics.set_retrieve_time(retrieve_time_list)
+        self.stats_monitor.set_retrieve_time(retrieve_time_list)
         # store duration
         store_duration_list = [cur_time - node.create_time for node in nodes]
-        self.metrics.set_store_duration(store_duration_list)
+        self.stats_monitor.set_store_duration(store_duration_list)
         # num_stores
         num_active_by_node = [len(node.key) if (node.hit_count > 0) else 0 for node in nodes]
         num_stores_by_node = [len(node.key) for node in nodes]
-        self.metrics.set_active_and_store(sum(num_active_by_node), sum(num_stores_by_node))
+        self.stats_monitor.set_active_and_store(sum(num_active_by_node), sum(num_stores_by_node))
 
-
+    def get_stats(self):
+        return self.stats_monitor.get_stats()
 
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: List, timestamp: float = None):
-        query_len = len(key)
         if timestamp is None:
             timestamp = time.time()
         node.last_access_time = timestamp
@@ -325,6 +370,7 @@ class RadixCache():
         child_key = self.get_child_key_fn(key)
 
         value = []
+        num_new_actives = 0 # for metrics
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = timestamp
@@ -333,18 +379,22 @@ class RadixCache():
                 new_node = self._split_node(child.key, child, prefix_len, last_access_time=timestamp)
                 value.append(new_node.value)
                 node = new_node
+                if node.hit_count == 0:
+                    # found new active
+                    num_new_actives += prefix_len # len(node.key) # num of new hit tok/blocks
                 node.hit_count += 1
                 break
             else:
                 value.append(child.value)
                 node = child
+                if node.hit_count == 0:
+                    # found new active
+                    num_new_actives += prefix_len # num of new hit tok/blocks
                 node.hit_count += 1
                 key = key[prefix_len:]
                 if len(key):
                     child_key = self.get_child_key_fn(key)
-
-        # update metrics
-        self.metrics.update_hits(query_len, len(value))
+        self.stats_monitor.update_actives(num_new_actives)
         return value, node
 
     def _split_node(self, key, child: TreeNode, split_len: int, last_access_time: float = None):
@@ -396,8 +446,8 @@ class RadixCache():
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
         
-        # update metrics
-        self.metrics.update_stores(num_stores=len(key), timestamp=timestamp)
+        # update stats
+        self.stats_monitor.update_stores(num_new_stores=len(key), timestamp=timestamp)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
@@ -464,7 +514,6 @@ class RadixCache():
                 ret_list.extend(cur_node.children.values())
                 stack.extend(cur_node.children.values())
         return ret_list
-
 
 if __name__ == "__main__":
     
